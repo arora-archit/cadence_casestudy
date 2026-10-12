@@ -12,10 +12,21 @@ sent to an external API.
 - **Text extraction**: PyMuPDF (PDF), python-docx (DOCX), python-pptx
   (PPTX), plain read (TXT), Tesseract OCR (PNG/JPG). Scanned PDF pages are
   detected automatically and OCR'd page-by-page.
-- **PII detection**: regex for structured PII (email, phone, Aadhaar, PAN,
-  employee ID, date of birth, address heuristic) and spaCy NER for person
-  names. Detection patterns are configurable in `pii_app/config.py` and
-  categories can be toggled on/off in the sidebar.
+- **PII detection**: [Microsoft Presidio](https://github.com/microsoft/presidio)
+  as the detection engine — real `phonenumbers`-library phone validation
+  (region-aware, not just digit-counting), spaCy NER for person names,
+  and custom-registered recognizers for India-specific structured PII
+  (Aadhaar, PAN, employee ID, date of birth, PIN code). Aadhaar numbers
+  are validated with a real **Verhoeff checksum** (the same check-digit
+  algorithm UIDAI uses) and PAN numbers with the official 4th-character
+  holder-type rule (`pii_app/checksums.py`) — a checksum pass raises
+  confidence to "verified"; a failure leaves the match visible at lower
+  confidence rather than hiding it, since a redaction tool should err
+  toward flagging. ADDRESS has no Presidio equivalent and stays a
+  keyword-proximity heuristic. Detection patterns are configurable in
+  `pii_app/config.py` and categories can be toggled on/off in the
+  sidebar. See "Extraction Logic" below for why this replaced a pure
+  regex + raw-spaCy approach.
 - **Redaction**: offset-accurate replacement with numbered placeholders
   (`[PERSON_1]`, `[EMAIL_1]`, `[EMPLOYEE_ID_1]`, ...), preserving all
   surrounding text exactly.
@@ -155,51 +166,68 @@ scanned, not digitally authored." It errs toward OCR-ing pages that
 didn't strictly need it (cheap) rather than skipping OCR on a page that
 did (expensive — a page of missed PII).
 
-**Detection logic**, once text is extracted, runs two tiers over the same
-string with character-offset tracking throughout:
+**Detection logic**, once text is extracted, runs through Presidio's
+`AnalyzerEngine` (`pii_app/presidio_engine.py`) plus one standalone
+heuristic, with character-offset tracking throughout:
 
-1. **Regex tier** (`pii_app/config.py` → `REGEX_PATTERNS`) — deterministic
-   pattern matches for EMAIL, PHONE, AADHAAR, PAN, EMPLOYEE_ID, PINCODE.
-   DATE_OF_BIRTH is a special case: a generic date pattern is only
-   promoted to `DATE_OF_BIRTH` if a DOB keyword ("dob", "date of birth",
-   "born", ...) appears within `DOB_KEYWORD_WINDOW` (25 chars) before it —
-   otherwise it's not classified as PII at all. ADDRESS uses a similar
-   keyword-proximity heuristic: text following "Address:", "residing
-   at", etc., up to the next line break or a 120-character cap.
-2. **NER tier** (`pii_detection.py` → `_detect_person_names`) — spaCy's
-   `en_core_web_sm` pipeline tags `PERSON` entities directly from the raw
-   text, independent of any pattern. Raw spaCy output on jargon-heavy
-   corporate documents is noisy — a small model trained on general text
-   reads Title-Cased headers and acronyms ("TPRM", "Trigger", "Vendor
-   Tier", "Change Workflow") as names, and paragraphs/table cells joined
-   by bare `\n` (no sentence punctuation) cause it to fuse several
-   adjacent names into one entity. Two post-filters bring precision back
-   up before a match is accepted (`_looks_like_person_name` and the
-   per-line split in `_detect_person_names`): split each raw entity on
-   line breaks and validate each piece independently; require 2–4 words,
-   each either title-case (allowing `'`/`-`) or a ≤3-letter all-caps token
-   treated as initials ("KC", "DK"); and reject any candidate where a word
+1. **Presidio tier** — a single `analyzer.analyze()` call covers EMAIL,
+   PHONE (via the `phonenumbers`-backed `PhoneRecognizer`, restricted to
+   Indian numbers), PERSON (spaCy NER under the hood), and custom
+   recognizers registered for AADHAAR, PAN, EMPLOYEE_ID, DATE_OF_BIRTH,
+   and PINCODE — India-specific formats Presidio has no built-in support
+   for. Two of these carry real validation instead of shape-only regex
+   (`pii_app/checksums.py`): AADHAAR runs a **Verhoeff checksum** (the
+   same check-digit algorithm UIDAI uses — a pass raises confidence to
+   1.0, a fail leaves it at the base pattern score rather than discarding
+   the match, since a redaction tool should err toward flagging over
+   hiding) and PAN validates its 4th-character holder-type code (P =
+   Individual, C = Company, H = HUF, ...). DATE_OF_BIRTH uses Presidio's
+   **context-aware enhancer**: a bare date gets a low base score (0.2,
+   below the display threshold) that only clears `DEFAULT_MIN_CONFIDENCE`
+   (0.5) when a DOB keyword ("dob", "birth", "born", "bday") is lemma-
+   matched among the nearby tokens — replacing a hand-written
+   character-offset window with Presidio's token-aware mechanism.
+   Presidio's own `PERSON` recognizer is spaCy underneath, so it inherits
+   spaCy's weaknesses on jargon-heavy corporate text: a small model
+   trained on general English reads Title-Cased headers and acronyms
+   ("TPRM", "Trigger", "Vendor Tier", "Change Workflow") as names, and
+   paragraphs/table cells joined by bare `\n` (no sentence punctuation)
+   cause it to fuse several adjacent names into one entity. Two
+   post-filters in `pii_detection.py` fix this before a match is accepted
+   (`_looks_like_person_name` and the per-line split in
+   `_filter_person_result`): split each raw entity on line breaks and
+   validate each piece independently; require 2–4 words, each either
+   title-case (allowing `'`/`-`) or a ≤3-letter all-caps token treated as
+   initials ("KC", "DK"); and reject any candidate where a word
    (lowercased, trailing possessive stripped) appears in the configurable
-   `PERSON_NAME_STOPWORDS` denylist in `config.py`. On a real 94K-character
-   policy document in `sample_data/`, this took PERSON detections from 219
-   (the overwhelming majority false positives: "TPRM", "Workflow",
-   "Navigate", merged multi-name blobs) down to 26 — all 26 genuine names,
-   zero jargon. The address heuristic got an equivalent fix: keyword
-   matching now uses word boundaries (previously `"address"` matched
-   inside `"addressee"` via plain substring search), and a captured
-   snippet is only accepted if it contains a digit or at least two
-   comma-separated segments — screening out generic prose that happened
-   to sit near a keyword.
+   `PERSON_NAME_STOPWORDS` denylist in `config.py`. On a real
+   94K-character policy document in `sample_data/`, this took PERSON
+   detections from 219 (the overwhelming majority false positives:
+   "TPRM", "Workflow", "Navigate", merged multi-name blobs) down to 26 —
+   all 26 genuine names, zero jargon.
+2. **Address heuristic** (`pii_detection.py` → `_detect_addresses`) —
+   Presidio has no generic unstructured-address recognizer, so this
+   stays a standalone keyword-proximity heuristic: text following
+   "Address:", "residing at", etc., up to the next line break or a
+   120-character cap. Keyword matching uses word boundaries (so
+   `"address"` can't match inside `"addressee"` via plain substring
+   search), and a captured snippet is only accepted if it contains a
+   digit or at least two comma-separated segments — screening out
+   generic prose that happened to sit near a keyword.
 
 Both tiers emit `PIIMatch(label, start, end, text, confidence, source)`
 against the **same original string**, so there is one coordinate space
 for every detection regardless of which detector found it. Overlaps
-between tiers (e.g. a regex EMPLOYEE_ID match that partially overlaps a
-spaCy PERSON span) are resolved by `_resolve_overlaps()`: matches are
-sorted by confidence (descending) then span length (descending), and
-greedily kept only if they don't overlap an already-kept span — so the
-final detection list is always offset-disjoint, which is what makes
-single-pass, right-to-left redaction safe.
+(e.g. an EMPLOYEE_ID match that partially overlaps a PERSON span) are
+resolved by `_resolve_overlaps()`: matches are sorted by confidence
+(descending) then span length (descending), and greedily kept only if
+they don't overlap an already-kept span — so the final detection list is
+always offset-disjoint, which is what makes single-pass, right-to-left
+redaction safe. A final pass drops anything below
+`DEFAULT_MIN_CONFIDENCE` (0.5) — each category's base confidence in
+`config.py` is tuned against this threshold on purpose (AADHAAR/PAN sit
+just above it so an unverified ID still surfaces; DATE_OF_BIRTH sits
+below it so a bare date doesn't).
 
 ### 04. Reliable Outcomes
 
@@ -310,10 +338,12 @@ for e in entries:
 ```
 app.py                      Streamlit UI: wires the pipeline together
 pii_app/
-  config.py                 Regex patterns, keyword lists, enabled categories
+  config.py                 Patterns, keyword lists, enabled categories, confidence tuning
   file_validation.py        Extension/size checks on uploads
   text_extraction.py        Format-specific text extraction + OCR fallback
-  pii_detection.py           Regex + spaCy detection, overlap resolution
+  presidio_engine.py        Presidio AnalyzerEngine + custom recognizers (AADHAAR/PAN/etc.)
+  checksums.py              Verhoeff (Aadhaar) + structural (PAN) ID validation
+  pii_detection.py           Presidio orchestration, PERSON precision filter, overlap resolution
   redaction.py               Offset-based placeholder substitution
   reporting.py               JSON report building (per-file and batch)
   llm_simulation.py          Local stand-in for a downstream LLM call
@@ -398,7 +428,20 @@ Be aware of:
   PINCODE/AADHAAR patterns even when they aren't PII (order numbers,
   reference codes, phone-adjacent numbers). PINCODE detection is disabled
   by default for this reason, and all regex categories should be spot-
-  checked against real documents before trusting them at scale.
+  checked against real documents before trusting them at scale. The
+  Verhoeff/PAN checksum validators cut this down for AADHAAR/PAN
+  specifically but don't eliminate it: a *real* 12-digit number that
+  happens to pass the Verhoeff check by chance (roughly 1-in-10 odds for
+  an arbitrary digit run) is indistinguishable from a real Aadhaar number
+  by this tool alone — the checksum raises confidence, it doesn't prove
+  the number is actually an Aadhaar number.
+- **An unverified checksum match is shown, not hidden**: an AADHAAR/PAN
+  candidate that matches the shape but fails checksum/structural
+  validation still surfaces (at a lower, non-"verified" confidence)
+  rather than being discarded — by design, since a failed check could
+  equally mean a real ID with an OCR/typo error as a non-ID number. Don't
+  read "detected" as "confirmed valid" for these two categories; check
+  the confidence score and `source` field in the detections table.
 - **False negatives**: spaCy's small English model (`en_core_web_sm`) can
   miss uncommon name formats, non-Western names, or names in unusual
   casing/formatting. The precision filter in `_looks_like_person_name()`

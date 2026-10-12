@@ -23,11 +23,11 @@ from pii_app.text_extraction import extract_text
 st.set_page_config(page_title="PII Detection & Redaction", page_icon="🛡️", layout="wide")
 
 
-@st.cache_resource(show_spinner="Loading spaCy model...")
-def _warm_spacy():
-    from pii_app.pii_detection import get_nlp
+@st.cache_resource(show_spinner="Loading detection engine (Presidio + spaCy)...")
+def _warm_analyzer():
+    from pii_app.presidio_engine import get_analyzer
 
-    return get_nlp()
+    return get_analyzer()
 
 
 def process_file(uploaded_file, enabled_categories: dict) -> dict:
@@ -184,8 +184,8 @@ def main():
             st.markdown(_LIMITATIONS_TEXT)
         return
 
-    with st.spinner("Loading NLP model..."):
-        _warm_spacy()
+    with st.spinner("Loading detection engine..."):
+        _warm_analyzer()
 
     results = []
     progress = st.progress(0.0, text="Processing files...")

@@ -14,7 +14,10 @@ def test_detects_email():
 
 
 def test_detects_phone_number():
-    text = "Call +91 9876543210 for support."
+    # "Phone:" is the context keyword that boosts PhoneRecognizer's base
+    # score above DEFAULT_MIN_CONFIDENCE (bare "Call ..." does not: "call"
+    # is a spaCy stopword and never counts as context — see config.py).
+    text = "Phone: +91 9876543210"
     matches = detect_pii(text)
     phones = [m for m in matches if m.label == "PHONE"]
     assert len(phones) == 1

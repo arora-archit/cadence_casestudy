@@ -1,30 +1,40 @@
-"""PII detection: structured patterns via regex, person names via spaCy.
+"""PII detection: Presidio (structured patterns + spaCy NER) plus one
+custom heuristic (ADDRESS) that Presidio has no fixed shape for.
 
-Detection is deliberately two-tier:
-  - Regex handles structured, format-predictable PII (emails, IDs, phone
-    numbers, government IDs, dates).
-  - spaCy's NER handles unstructured PII (person names) that regex cannot
-    reliably capture.
+Why Presidio: it gives real phone-number validation (`phonenumbers`
+library — actual national number-plan rules, not "10 digits"), a
+context-aware scorer (boosts a match's confidence when a relevant keyword
+sits nearby, replacing a hand-written character-offset window), and a
+single recognizer-registry architecture — see pii_app/presidio_engine.py
+for the custom AADHAAR/PAN/EMPLOYEE_ID/DATE_OF_BIRTH/PINCODE recognizers
+registered into it, each backed by real validation where one exists
+(checksums.py).
 
-Both tiers emit PIIMatch objects with character offsets into the ORIGINAL
-text, so redaction can be done purely by offset without re-scanning text.
+Presidio's own PERSON recognizer is just spaCy's NER under the hood, so
+it inherits the same failure mode as before: a small general-English
+model reads Title-Cased business jargon ("TPRM", "Trigger", "Vendor
+Tier") as names, and text joined across paragraphs/table cells with bare
+"\\n" (no sentence punctuation) gets multiple adjacent names fused into
+one entity. _looks_like_person_name() and the per-line split in
+_filter_person_result() are the same precision fix as before, just
+applied to Presidio's RecognizerResult instead of a raw spaCy entity.
+
+All detectors emit PIIMatch objects with character offsets into the
+ORIGINAL text, so redaction can be done purely by offset without
+re-scanning text.
 """
 
 import re
 from dataclasses import dataclass
 
-import spacy
-
 from pii_app.config import (
     ADDRESS_KEYWORDS,
     DEFAULT_ENABLED_CATEGORIES,
-    DOB_KEYWORD_WINDOW,
-    DOB_KEYWORDS,
-    PERSON_CONFIDENCE,
+    DEFAULT_MIN_CONFIDENCE,
     PERSON_MAX_WORDS,
     PERSON_NAME_STOPWORDS,
-    REGEX_PATTERNS,
 )
+from pii_app.presidio_engine import get_analyzer
 
 # Word shapes accepted inside a candidate person name: ordinary title-case
 # words (allowing an internal apostrophe/hyphen, e.g. "O'Brien", "Szeto-Lin")
@@ -36,7 +46,18 @@ _INITIALS_WORD = re.compile(r"^[A-Z]{1,3}$")
 # before validation (punctuation left over from sentence/list formatting).
 _EDGE_PUNCT = " \t:;,.()[]\"'"
 
-_NLP_CACHE = {}
+# Our category names <-> Presidio's entity type names.
+_LABEL_TO_PRESIDIO_ENTITY = {
+    "EMAIL": "EMAIL",
+    "PHONE": "PHONE_NUMBER",
+    "PERSON": "PERSON",
+    "AADHAAR": "AADHAAR",
+    "PAN": "PAN",
+    "EMPLOYEE_ID": "EMPLOYEE_ID",
+    "DATE_OF_BIRTH": "DATE_OF_BIRTH",
+    "PINCODE": "PINCODE",
+}
+_PRESIDIO_ENTITY_TO_LABEL = {v: k for k, v in _LABEL_TO_PRESIDIO_ENTITY.items()}
 
 
 @dataclass
@@ -46,73 +67,66 @@ class PIIMatch:
     end: int
     text: str
     confidence: float
-    source: str  # "regex" or "spacy"
+    source: str  # "presidio" or "regex" (the ADDRESS heuristic)
 
 
-def get_nlp():
-    """Load (and cache) the spaCy pipeline. Kept lazy so imports stay fast."""
-    from pii_app.config import SPACY_MODEL
+def _looks_like_person_name(candidate: str) -> bool:
+    """Validate a candidate name's shape and screen it against the domain
+    noun stoplist (see config.PERSON_NAME_STOPWORDS for why this exists).
+    """
+    words = candidate.split()
+    if not (2 <= len(words) <= PERSON_MAX_WORDS):
+        return False
 
-    if SPACY_MODEL not in _NLP_CACHE:
-        try:
-            _NLP_CACHE[SPACY_MODEL] = spacy.load(SPACY_MODEL)
-        except OSError as exc:
-            raise RuntimeError(
-                f"spaCy model '{SPACY_MODEL}' is not installed. "
-                f"Run: python -m spacy download {SPACY_MODEL}"
-            ) from exc
-    return _NLP_CACHE[SPACY_MODEL]
+    for word in words:
+        bare = word.strip("'’")
+        stoplist_key = re.sub(r"['’]s$", "", bare).lower()
+        if stoplist_key in PERSON_NAME_STOPWORDS:
+            return False
 
-
-def _detect_regex_matches(text: str, enabled_categories: dict) -> list:
-    matches = []
-
-    for key, spec in REGEX_PATTERNS.items():
-        if key == "DATE_OF_BIRTH":
-            continue  # handled separately with keyword context
-        if key == "PINCODE" and not enabled_categories.get("PINCODE", False):
+        if _INITIALS_WORD.match(word):
             continue
-        if key != "PINCODE" and not enabled_categories.get(key, True):
+        if word.isupper() and len(word) > 3:
+            return False  # likely an acronym (TPRM), not initials
+        if not _TITLE_CASE_WORD.match(word):
+            return False
+
+    return True
+
+
+def _filter_person_result(text: str, result) -> list:
+    """Split a Presidio PERSON result on line breaks and validate each
+    piece independently (see module docstring for why the split matters).
+    """
+    matches = []
+    raw = text[result.start:result.end]
+
+    for line_match in re.finditer(r"[^\n]+", raw):
+        segment = line_match.group()
+        seg_start = result.start + line_match.start()
+
+        stripped = segment.strip(_EDGE_PUNCT)
+        if not stripped:
+            continue
+        lead_trim = len(segment) - len(segment.lstrip(_EDGE_PUNCT))
+        trail_trim = len(segment) - len(segment.rstrip(_EDGE_PUNCT))
+        candidate_start = seg_start + lead_trim
+        candidate_end = seg_start + len(segment) - trail_trim
+        candidate_text = text[candidate_start:candidate_end]
+
+        if not _looks_like_person_name(candidate_text):
             continue
 
-        for m in spec["pattern"].finditer(text):
-            matches.append(
-                PIIMatch(
-                    label=spec["label"],
-                    start=m.start(),
-                    end=m.end(),
-                    text=m.group(),
-                    confidence=spec["confidence"],
-                    source="regex",
-                )
+        matches.append(
+            PIIMatch(
+                label="PERSON",
+                start=candidate_start,
+                end=candidate_end,
+                text=candidate_text,
+                confidence=result.score,
+                source="presidio",
             )
-
-    return matches
-
-
-def _detect_dates_of_birth(text: str, enabled_categories: dict) -> list:
-    if not enabled_categories.get("DATE_OF_BIRTH", True):
-        return []
-
-    matches = []
-    date_pattern = REGEX_PATTERNS["DATE_OF_BIRTH"]["pattern"]
-    confidence = REGEX_PATTERNS["DATE_OF_BIRTH"]["confidence"]
-    lower_text = text.lower()
-
-    for m in date_pattern.finditer(text):
-        window_start = max(0, m.start() - DOB_KEYWORD_WINDOW)
-        context = lower_text[window_start:m.start()]
-        if any(keyword in context for keyword in DOB_KEYWORDS):
-            matches.append(
-                PIIMatch(
-                    label="DATE_OF_BIRTH",
-                    start=m.start(),
-                    end=m.end(),
-                    text=m.group(),
-                    confidence=min(confidence + 0.25, 0.95),
-                    source="regex",
-                )
-            )
+        )
 
     return matches
 
@@ -142,8 +156,10 @@ def _detect_addresses(text: str, enabled_categories: dict) -> list:
     keyword, up to the next line break or a reasonable character cap, then
     require the captured text to actually look like an address.
 
-    This is intentionally simple (no NLP address parser) and should be
-    treated as a starting point for analyst review, not a precise extractor.
+    Presidio has no generic unstructured-address recognizer to lean on
+    here, so this stays a hand-written heuristic — intentionally simple
+    and meant as a starting point for analyst review, not a precise
+    address parser.
     """
     if not enabled_categories.get("ADDRESS", True):
         return []
@@ -157,8 +173,6 @@ def _detect_addresses(text: str, enabled_categories: dict) -> list:
         if line_end == -1:
             line_end = len(text)
 
-        # Capture from just after the keyword (and any ":" / whitespace)
-        # to the end of the line, capped at 120 chars.
         content_start = keyword_end
         while content_start < line_end and text[content_start] in ":, \t":
             content_start += 1
@@ -186,92 +200,53 @@ def _detect_addresses(text: str, enabled_categories: dict) -> list:
     return matches
 
 
-def _looks_like_person_name(candidate: str) -> bool:
-    """Validate a candidate name's shape and screen it against the domain
-    noun stoplist (see config.PERSON_NAME_STOPWORDS for why this exists).
-    """
-    words = candidate.split()
-    if not (2 <= len(words) <= PERSON_MAX_WORDS):
-        return False
-
-    for word in words:
-        bare = word.strip("'’")
-        stoplist_key = re.sub(r"['’]s$", "", bare).lower()
-        if stoplist_key in PERSON_NAME_STOPWORDS:
-            return False
-
-        if _INITIALS_WORD.match(word):
-            continue
-        if word.isupper() and len(word) > 3:
-            return False  # likely an acronym (TPRM), not initials
-        if not _TITLE_CASE_WORD.match(word):
-            return False
-
-    return True
-
-
-def _detect_person_names(text: str, enabled_categories: dict) -> list:
-    if not enabled_categories.get("PERSON", True):
-        return []
-
-    nlp = get_nlp()
-    doc = nlp(text)
-    matches = []
-
-    for ent in doc.ents:
-        if ent.label_ != "PERSON":
-            continue
-
-        # Extraction from DOCX/PPTX joins paragraphs/cells with bare "\n",
-        # which gives spaCy no sentence boundary — it can fuse several
-        # adjacent names (or a name and the next line's header text) into
-        # one entity. Split on line breaks and validate each piece
-        # independently, in its own absolute offsets, before accepting it.
-        raw = text[ent.start_char:ent.end_char]
-        for line_match in re.finditer(r"[^\n]+", raw):
-            segment = line_match.group()
-            seg_start = ent.start_char + line_match.start()
-
-            stripped = segment.strip(_EDGE_PUNCT)
-            if not stripped:
-                continue
-            lead_trim = len(segment) - len(segment.lstrip(_EDGE_PUNCT))
-            trail_trim = len(segment) - len(segment.rstrip(_EDGE_PUNCT))
-            candidate_start = seg_start + lead_trim
-            candidate_end = seg_start + len(segment) - trail_trim
-            candidate_text = text[candidate_start:candidate_end]
-
-            if not _looks_like_person_name(candidate_text):
-                continue
-
-            matches.append(
-                PIIMatch(
-                    label="PERSON",
-                    start=candidate_start,
-                    end=candidate_end,
-                    text=candidate_text,
-                    confidence=PERSON_CONFIDENCE,
-                    source="spacy",
-                )
-            )
-
-    return matches
-
-
 def detect_pii(text: str, enabled_categories: dict = None) -> list:
-    """Run all detectors and return a de-duplicated, offset-sorted list of
-    PIIMatch objects. Overlapping matches are resolved by preferring the
-    higher-confidence (generally regex) match, then the longer span.
+    """Run Presidio plus the address heuristic and return a de-duplicated,
+    offset-sorted list of PIIMatch objects. Overlapping matches are
+    resolved by preferring the higher-confidence match, then the longer
+    span; matches below DEFAULT_MIN_CONFIDENCE are dropped afterward.
+
+    Each category's base confidence (config.py) is deliberately tuned
+    against this threshold: AADHAAR/PAN sit just above it so an
+    unverified-but-shape-matching ID still surfaces for review, while a
+    bare DATE_OF_BIRTH candidate sits below it and only clears the bar
+    once Presidio's context-aware enhancer boosts it (i.e. a DOB keyword
+    was actually nearby) — see presidio_engine.py.
     """
     enabled_categories = enabled_categories or DEFAULT_ENABLED_CATEGORIES
 
-    all_matches = []
-    all_matches.extend(_detect_regex_matches(text, enabled_categories))
-    all_matches.extend(_detect_dates_of_birth(text, enabled_categories))
-    all_matches.extend(_detect_addresses(text, enabled_categories))
-    all_matches.extend(_detect_person_names(text, enabled_categories))
+    requested_entities = [
+        presidio_entity
+        for label, presidio_entity in _LABEL_TO_PRESIDIO_ENTITY.items()
+        if enabled_categories.get(label, True)
+    ]
 
-    return _resolve_overlaps(all_matches)
+    all_matches = []
+
+    if requested_entities:
+        analyzer = get_analyzer()
+        results = analyzer.analyze(text=text, language="en", entities=requested_entities)
+
+        for result in results:
+            label = _PRESIDIO_ENTITY_TO_LABEL[result.entity_type]
+            if label == "PERSON":
+                all_matches.extend(_filter_person_result(text, result))
+            else:
+                all_matches.append(
+                    PIIMatch(
+                        label=label,
+                        start=result.start,
+                        end=result.end,
+                        text=text[result.start:result.end],
+                        confidence=result.score,
+                        source="presidio",
+                    )
+                )
+
+    all_matches.extend(_detect_addresses(text, enabled_categories))
+
+    resolved = _resolve_overlaps(all_matches)
+    return [m for m in resolved if m.confidence >= DEFAULT_MIN_CONFIDENCE]
 
 
 def _resolve_overlaps(matches: list) -> list:

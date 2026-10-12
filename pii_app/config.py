@@ -1,79 +1,98 @@
 """
 Configurable PII detection settings.
 
-Each entry in REGEX_PATTERNS defines a structured PII type detected via
-regular expressions. Add, remove, or tweak patterns here without touching
+Detection is split across two engines (see pii_app/presidio_engine.py):
+  - Presidio (presidio-analyzer) handles EMAIL, PHONE, PERSON, and the
+    custom-registered structured categories below (AADHAAR, PAN,
+    EMPLOYEE_ID, DATE_OF_BIRTH, PINCODE).
+  - A small amount of our own heuristic code handles ADDRESS, which has
+    no fixed shape Presidio's pattern mechanism can express.
+
+CUSTOM_PATTERNS defines the structured categories Presidio doesn't ship
+natively for India. Add, remove, or tweak patterns here without touching
 detection logic elsewhere in the app.
 
 Fields:
     label:       Category name used in reports and redaction placeholders.
-    pattern:     Compiled-at-load regex (case-insensitive by default).
-    confidence:  Static confidence score reported to the user (0-1).
-                 Regex matches are deterministic, so these are high but not
-                 all patterns are equally reliable (see README limitations).
+    pattern:     Regex string (compiled by presidio_engine.py).
+    confidence:  Base confidence (0-1) before any checksum validation.
+                 AADHAAR and PAN are checksum/structure-validated in
+                 checksums.py: a passing check raises the final score to
+                 1.0; a failing check leaves it at this base score rather
+                 than discarding the match (a redaction tool should err
+                 toward flagging, not silently dropping, a candidate ID).
 """
 
-import re
-
-REGEX_PATTERNS = {
+CUSTOM_PATTERNS = {
     "EMAIL": {
         "label": "EMAIL",
-        "pattern": re.compile(
-            r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
-        ),
-        "confidence": 0.95,
-    },
-    "PHONE": {
-        "label": "PHONE",
-        # Indian mobile numbers, with or without +91/0 prefix, optional
-        # spacing/hyphens. Deliberately conservative to limit false positives
-        # on generic 10-digit numbers (e.g. employee IDs).
-        "pattern": re.compile(
-            r"(?:\+91[\-\s]?|0)?[6-9]\d{9}\b"
-        ),
-        "confidence": 0.80,
+        # Presidio's own built-in EmailRecognizer intermittently returns
+        # zero matches on some real documents in this app's test corpus
+        # (reproducible, cause not pinned down — likely an edge case in
+        # its regex-timeout wrapper) despite the same pattern matching
+        # fine standalone. Using our own well-tested pattern here avoids
+        # depending on that recognizer at all.
+        "pattern": r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+        "confidence": 0.9,
     },
     "AADHAAR": {
         "label": "AADHAAR",
         # 12 digits, optionally grouped as 4-4-4 with spaces or hyphens.
-        "pattern": re.compile(
-            r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b"
-        ),
-        "confidence": 0.75,
+        # Verhoeff-checksum-validated in checksums.py.
+        "pattern": r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b",
+        "confidence": 0.50,
     },
     "PAN": {
         "label": "PAN",
-        # Indian PAN: 5 letters, 4 digits, 1 letter.
-        "pattern": re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b"),
-        "confidence": 0.90,
+        # Indian PAN: 5 letters, 4 digits, 1 letter. 4th-character
+        # holder-type code validated in checksums.py.
+        "pattern": r"\b[A-Z]{5}\d{4}[A-Z]\b",
+        "confidence": 0.55,
     },
     "EMPLOYEE_ID": {
         "label": "EMPLOYEE_ID",
         # Common internal ID conventions: EMP-1234, EMP12345, E-00123, etc.
-        "pattern": re.compile(r"\b(?:EMP|EID)[\-_]?\d{3,8}\b", re.IGNORECASE),
+        "pattern": r"\b(?:EMP|EID)[\-_]?\d{3,8}\b",
         "confidence": 0.85,
     },
     "DATE_OF_BIRTH": {
         "label": "DATE_OF_BIRTH",
-        # dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy — flagged as DOB only when
-        # near a DOB keyword by the detector (see pii_detection.py), since
-        # a bare date could be any date.
-        "pattern": re.compile(
-            r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b"
-        ),
-        "confidence": 0.60,
+        # dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy — base score is deliberately
+        # low; Presidio's context-aware enhancer (see presidio_engine.py)
+        # boosts it when a DOB keyword is nearby, since a bare date could
+        # be any date at all.
+        "pattern": r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b",
+        "confidence": 0.20,
     },
     "PINCODE": {
         "label": "PINCODE",
-        "pattern": re.compile(r"\b\d{6}\b"),
+        "pattern": r"\b\d{6}\b",
         "confidence": 0.55,
     },
 }
 
-# Keywords that, when found within this many characters before a DATE match,
-# upgrade a generic date into a DATE_OF_BIRTH detection.
-DOB_KEYWORD_WINDOW = 25
-DOB_KEYWORDS = ["dob", "date of birth", "born", "birth date"]
+# Context words that let Presidio's context-aware enhancer boost a bare
+# date match's score when one appears nearby — turning a low base score
+# (any date) into a high one (specifically a date of birth). See
+# presidio_engine.py for how this plugs into the recognizer.
+#
+# Presidio's context matcher checks "is this context word a substring of
+# one of the (single-token, lemmatized) words surrounding the match" —
+# so these must be single tokens, not phrases. "date of birth" as a whole
+# phrase would never match against individual surrounding tokens like
+# "birth"; "birth" alone does.
+DOB_KEYWORDS = ["dob", "birth", "born", "bday"]
+
+# Context words that boost PHONE_NUMBER confidence when nearby. Presidio's
+# context matcher drops any surrounding word spaCy treats as a stopword
+# before comparing — "call" is in spaCy's default English stopword list,
+# so it's omitted here; it would never match anyway.
+PHONE_CONTEXT_KEYWORDS = ["phone", "contact", "mobile", "cell", "telephone", "number", "reach", "reachable"]
+
+# Indian mobile numbers only, for Presidio's built-in PhoneRecognizer
+# (backed by the `phonenumbers` library, which validates real number
+# structure — not just digit count — per region).
+PHONE_SUPPORTED_REGIONS = ("IN",)
 
 # Keywords that, when found on the same line as a PINCODE/number run,
 # help flag an ADDRESS block. Simple heuristic, not a full NLP parse.
