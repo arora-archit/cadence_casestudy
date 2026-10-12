@@ -1,0 +1,17 @@
+INTERNAL INVESTIGATION - INCIDENT REPORT #INC-0092
+
+Reported by: Siddharth Kapoor (Employee ID: EMP-10233)
+Contact: siddharth.kapoor@examplecorp.com, +91 9988776655
+
+Summary:
+On 11-09-2023, a complaint was filed by Meera Iyer regarding unauthorized
+access to a shared drive. Meera Iyer's employee record lists her date of
+birth as 22/07/1988 and her residing at 48B Palm Grove Apartments,
+MG Road, Bengaluru, Karnataka, 560001.
+
+The access logs show a login from an account associated with
+Kabir Singh (PAN: PQRSX5678L, Aadhaar: 5678-9012-3456), whose registered
+phone number is 9871234560. Kabir Singh denied involvement when
+interviewed by HR representative Ananya Desai.
+
+Escalation contact: hr-escalations@examplecorp.com

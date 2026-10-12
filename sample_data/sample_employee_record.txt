@@ -1,0 +1,19 @@
+CONFIDENTIAL - EMPLOYEE RECORD
+
+Employee Name: Rohan Mehta
+Employee ID: EMP-20481
+Email: rohan.mehta@examplecorp.com
+Phone: +91 9876543210
+Date of Birth: 14/03/1991
+PAN: ABCDE1234F
+Aadhaar: 2345 6789 1023
+
+Address: 14 Lakeview Residency, Sector 21, Gurugram, Haryana, 122018
+
+Notes:
+Rohan Mehta joined the Finance team in 2019 and currently reports to
+Priya Nair. His secondary contact email is rohan.m.personal@gmail.com
+and his emergency contact is his spouse, Ananya Mehta, reachable at
++91 9123456780.
+
+This record was last reviewed by Priya Nair on 02-01-2024.
